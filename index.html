@@ -325,7 +325,10 @@ function supaBackend(sb, uid){
     if (error) throw error;
     return data ? data.data : null;
   };
-  const deliver = (id, d) => { lsSet('mpt-cache-'+id, d); (cbs[id]||[]).forEach(f=>f(d ? clone(d) : null)); };
+  const last = {};
+  const deliver = (id, d) => {
+    const j = JSON.stringify(d||null); if (last[id]===j) return; last[id]=j; // sin cambios: no redibujar
+    lsSet('mpt-cache-'+id, d); (cbs[id]||[]).forEach(f=>f(d ? clone(d) : null)); };
   // cambios hechos desde otro dispositivo, en vivo
   sb.channel('mpt-'+uid).on('postgres_changes', {event:'*', schema:'public', table:T, filter:'user_id=eq.'+uid}, p => {
     const row = p.new && p.new.doc_id ? p.new : p.old; if (!row || !row.doc_id) return;
@@ -347,7 +350,7 @@ function supaBackend(sb, uid){
     watch: (id, cb, onErr) => {
       (cbs[id] ||= []).push(cb);
       const cached = lsGet('mpt-cache-'+id);
-      if (cached) cb(clone(cached));
+      if (cached){ last[id] = JSON.stringify(cached); cb(clone(cached)); }
       fetchOne(id).then(d => deliver(id, d)).catch(e => { if (!cached && onErr) onErr(e); });
       return () => { cbs[id] = (cbs[id]||[]).filter(f=>f!==cb); };
     },
@@ -716,14 +719,63 @@ let softT=null;
 function softRender(){ clearTimeout(softT); softT=setTimeout(render, 250); }
 function hideChrome(){ document.querySelector('nav.bottom')?.remove(); document.querySelector('.fab')?.remove(); }
 
+/* ---- lo que se está escribiendo no se pierde ---- */
+let inClick = false;
+function campoEditable(el){ return el && el.id && (el.tagName==='TEXTAREA' || (el.tagName==='INPUT' && ['text','date','password','email','number',''].includes(el.type))); }
+function camposEscritos(root){
+  const out = {}; if (!root) return out;
+  root.querySelectorAll('input,textarea').forEach(el=>{ if (campoEditable(el) && el.value !== el.defaultValue) out[el.id] = el.value; });
+  return out;
+}
+function devolverCampos(root, campos){
+  for (const [id,v] of Object.entries(campos||{})){ const el = root.querySelector('#'+CSS.escape(id)); if (el && campoEditable(el)) el.value = v; }
+}
+function paint(html){
+  const app = document.getElementById('app');
+  const y = window.scrollY; const act = document.activeElement; const focusId = act && act.id;
+  let sel = null; try{ if (act && act.selectionStart!=null) sel=[act.selectionStart, act.selectionEnd]; }catch(e){}
+  const keep = inClick ? {} : camposEscritos(app); // tras una acción tuya, los campos usados se limpian normalmente
+  app.innerHTML = html;
+  devolverCampos(app, keep);
+  if (focusId){ const el=document.getElementById(focusId); if (campoEditable(el)){ el.focus({preventScroll:true}); try{ if(sel) el.setSelectionRange(sel[0],sel[1]); else el.setSelectionRange(el.value.length, el.value.length);}catch(e){} } }
+  window.scrollTo(0,y);
+}
+/* ---- borrador: si el celular cierra la app en segundo plano, se recupera ---- */
+function guardarBorrador(){
+  if (!cfg && store.mode!=='auth') return;
+  const layer = document.getElementById('layer');
+  const hoja = ui.pago ? 'pago' : (layer && layer.querySelector('#g-monto') ? 'gasto' : null);
+  const campos = Object.assign(camposEscritos(document.getElementById('app')), camposEscritos(layer));
+  if (!hoja && !Object.keys(campos).length){ lsDel('mpt-borrador'); return; }
+  lsSet('mpt-borrador', {t:Date.now(), view, hoja, gastoCat:ui.gastoCat, pago: ui.pago ? {...ui.pago, items:null} : null, campos});
+}
+let borradorListo = false;
+function recuperarBorrador(){
+  if (borradorListo) return; borradorListo = true;
+  const b = lsGet('mpt-borrador'); lsDel('mpt-borrador');
+  if (!b || Date.now()-b.t > 3*3600*1000) return;
+  if (b.view && cfg && cfg.setupDone && cfg.periodo) view = b.view;
+  if (b.gastoCat) ui.gastoCat = b.gastoCat;
+  setTimeout(()=>{
+    if (b.hoja==='gasto' && cfg && cfg.periodo) openGasto();
+    if (b.hoja==='pago' && cfg && cfg.periodo && b.pago){ ui.pago = {...b.pago, paso:1}; renderPago(); }
+    devolverCampos(document, b.campos);
+    if (b.hoja==='gasto') updQuedan();
+    toast('Recuperé lo que estabas escribiendo.');
+  }, 0);
+}
+document.addEventListener('visibilitychange', ()=>{ if (document.visibilityState==='hidden') guardarBorrador(); else lsDel('mpt-borrador'); });
+window.addEventListener('pagehide', guardarBorrador);
+
 function render(){
   const app = document.getElementById('app');
   if (!loaded.cfg) return;
-  if (store.mode==='auth'){ app.innerHTML = renderLogin(); hideChrome(); return; }
-  if (store.mode==='offline'){ app.innerHTML = renderOffline(); hideChrome(); return; }
-  if (!cfg || !cfg.setupDone){ app.innerHTML = renderSetup(); hideChrome(); return; }
+  if (store.mode==='auth'){ paint(renderLogin()); hideChrome(); return; }
+  if (store.mode==='offline'){ paint(renderOffline()); hideChrome(); return; }
+  if (!borradorListo) recuperarBorrador();
+  if (!cfg || !cfg.setupDone){ paint(renderSetup()); hideChrome(); return; }
   cfg.metas ||= []; cfg.deudas ||= []; cfg.fondo ||= 0; cfg.largo ||= 0; cfg.historial ||= [];
-  if (!cfg.periodo){ app.innerHTML = renderMigrar(); hideChrome(); return; }
+  if (!cfg.periodo){ paint(renderMigrar()); hideChrome(); return; }
   if (!cfg.diaPago) cfg.diaPago = parseISO(cfg.periodo.inicio).getDate();
   if (!viewPid || !periodoById(viewPid)) viewPid = curPid();
   watchDoc(curPid()); watchDoc(viewPid);
@@ -739,10 +791,7 @@ function render(){
   if (view==='metas') body = renderMetas();
   if (view==='ajustes') body = renderAjustes();
   const note = store.mode==='local' ? '<p class="save-note">Guardando solo en este navegador. Para usarla en otro dispositivo, pasa tus datos con "Respaldo" en Mi plan.</p>' : '<p class="save-note">Tus datos son privados y se sincronizan entre tus dispositivos.</p>';
-  const y = window.scrollY; const focusId = document.activeElement && document.activeElement.id;
-  app.innerHTML = top + `<div class="stack">${body}</div>` + note;
-  if (focusId){ const el=document.getElementById(focusId); if(el && el.tagName==='INPUT' && el.type==='text'){ el.focus(); try{ el.setSelectionRange(el.value.length, el.value.length);}catch(e){} } }
-  window.scrollTo(0,y);
+  paint(top + `<div class="stack">${body}</div>` + note);
   renderChrome();
 }
 function renderChrome(){
@@ -1060,7 +1109,8 @@ function toast(msg, undo){
 }
 
 /* ============ eventos ============ */
-document.addEventListener('click', e=>{
+document.addEventListener('click', e=>{ inClick = true; try { onClick(e); } finally { inClick = false; } });
+function onClick(e){
   const b = e.target.closest('[data-act]'); if(!b) return;
   const act = b.dataset.act, id = b.dataset.id;
   if (act==='closeSheet'){ if (e.target===b) closeSheet(); return; }
@@ -1194,7 +1244,7 @@ document.addEventListener('click', e=>{
       cfg.periodo = {inicio:fecha, sueldo:monto}; cfg.diaPago = parseISO(fecha).getDate();
       saveCfg(); savePer(pid); viewPid=pid; ui.migr=null; render(); break; }
   }
-});
+}
 
 document.addEventListener('change', e=>{
   const t = e.target; if (!cfg || !cfg.setupDone || !cfg.periodo) return;
