@@ -1,6 +1,6 @@
 // Permite instalar la app y abrirla aunque no haya señal.
 // Los datos siempre se leen y guardan en Supabase; aquí solo se guarda la "cáscara" de la app.
-const CACHE = 'mpt-v2';
+const CACHE = 'mpt-v3';
 const SHELL = ['./', './index.html', './config.js', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png', './icons/favicon.png',
   'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js'];

@@ -294,6 +294,9 @@ function lsSet(k,v){ try{ localStorage.setItem(k,JSON.stringify(v)); }catch(e){}
 function lsDel(k){ try{ localStorage.removeItem(k); }catch(e){} }
 const stripMeta = d => { const c = clone(d); delete c._loaded; return c; };
 
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_,rej)=>setTimeout(()=>rej(Object.assign(new Error('timeout'),{code:'timeout'})), ms))]);
+let offlineInfo = '';
+
 /* ---- backend: Claude ---- */
 function claudeBackend(db, uid){
   const col = () => db.collection('data/users/'+uid);
@@ -318,7 +321,7 @@ function supaBackend(sb, uid){
   const cbs = {};
   const T = 'app_docs';
   const fetchOne = async id => {
-    const { data, error } = await sb.from(T).select('data').eq('user_id', uid).eq('doc_id', id).maybeSingle();
+    const { data, error } = await withTimeout(sb.from(T).select('data').eq('user_id', uid).eq('doc_id', id).maybeSingle(), 10000);
     if (error) throw error;
     return data ? data.data : null;
   };
@@ -390,7 +393,9 @@ function watchDoc(docId){
 function startWith(be, mode){
   store.be = be; store.mode = mode;
   store.unsub.config = be.watch('config', d => { cfg = d; loaded.cfg = true; scheduleRender(); },
-    () => { if (!loaded.cfg && mode!=='local') startWith(localBackend(), 'local'); });
+    () => { if (loaded.cfg) return;
+      if (mode==='supa'){ goOffline(); return; }
+      if (mode!=='local') startWith(localBackend(), 'local'); });
 }
 
 /* ---- inicio de sesión (solo app web con Supabase) ---- */
@@ -398,13 +403,26 @@ let sb = null;
 async function initSupa(){
   const C = window.MPT_CONFIG;
   sb = window.supabase.createClient(C.supabaseUrl, C.supabaseAnonKey, {auth:{persistSession:true, autoRefreshToken:true}});
-  const { data:{ session } } = await sb.auth.getSession();
+  const { data:{ session } } = await withTimeout(sb.auth.getSession(), 8000);
+  if (session){ // comprobar que la base de datos responde antes de mostrar la app
+    const ping = await withTimeout(sb.from('app_docs').select('doc_id').limit(1), 8000).catch(e=>({error:e}));
+    if (ping.error && (ping.error.code==='timeout' || /fetch|network/i.test(String(ping.error.message||'')))) { goOffline(); return; }
+  }
   if (session) { store.uid = session.user.id; store.email = session.user.email; startWith(supaBackend(sb, session.user.id), 'supa'); }
   else { store.mode='auth'; loaded.cfg = true; render(); }
   sb.auth.onAuthStateChange((ev, s) => {
     if (ev==='SIGNED_IN' && s && store.mode==='auth'){ store.uid=s.user.id; store.email=s.user.email; loaded.cfg=false; startWith(supaBackend(sb, s.user.id), 'supa'); }
     if (ev==='SIGNED_OUT'){ location.reload(); }
   });
+}
+function goOffline(){ store.mode='offline'; loaded.cfg=true; render(); }
+function renderOffline(){
+  return `<div class="top"><div class="brand">Mi Plata <span>Tranquila</span></div></div><div class="stack">
+  <section class="card hero bad"><div class="lbl">Sin conexión con tus datos</div><h1 style="font-size:1.5rem;margin:4px 0 6px">No pude conectar con tu base de datos</h1><p style="margin:0">Tus datos están a salvo. Lo más probable es una de estas dos cosas:</p></section>
+  <section class="card"><div class="list">
+    <div class="li" style="display:block"><div class="name">El proyecto de Supabase está pausado</div><p class="small muted" style="margin:4px 0 0">En el plan gratis se pausa si pasa una semana sin uso. Entra a <b>supabase.com</b> → proyecto <b>mi-plata-tranquila</b> → <b>Restore project</b>. Tarda unos minutos.</p></div>
+    <div class="li" style="display:block"><div class="name">No tienes internet</div><p class="small muted" style="margin:4px 0 0">Revisa tu conexión y vuelve a intentar.</p></div>
+  </div><button class="btn wide" style="margin-top:12px" data-act="reintentar">Volver a intentar</button></section></div>`;
 }
 function renderLogin(){
   const a = ui.auth || (ui.auth = {modo:'entrar', email:'', msg:'', err:''});
@@ -436,7 +454,8 @@ document.addEventListener('submit', async e => {
 
 async function init(){
   if (window.MPT_CONFIG && window.MPT_CONFIG.supabaseUrl && !/TU-PROYECTO/.test(window.MPT_CONFIG.supabaseUrl) && window.MPT_CONFIG.supabaseAnonKey && !/PEGA-AQUI/.test(window.MPT_CONFIG.supabaseAnonKey) && window.supabase){
-    try { await initSupa(); return; } catch(e){ /* sigue al modo local */ }
+    try { await initSupa(); } catch(e){ goOffline(); }
+    return;
   }
   let db=null, user=null, id=null;
   try{
@@ -701,6 +720,7 @@ function render(){
   const app = document.getElementById('app');
   if (!loaded.cfg) return;
   if (store.mode==='auth'){ app.innerHTML = renderLogin(); hideChrome(); return; }
+  if (store.mode==='offline'){ app.innerHTML = renderOffline(); hideChrome(); return; }
   if (!cfg || !cfg.setupDone){ app.innerHTML = renderSetup(); hideChrome(); return; }
   cfg.metas ||= []; cfg.deudas ||= []; cfg.fondo ||= 0; cfg.largo ||= 0; cfg.historial ||= [];
   if (!cfg.periodo){ app.innerHTML = renderMigrar(); hideChrome(); return; }
@@ -1123,6 +1143,7 @@ document.addEventListener('click', e=>{
       cfg.fijos=cfg.fijos.filter(x=>x.id!==id); saveCfg(); render();
       if (f) toast('Quitaste "'+f.nombre+'". Quedan '+$f(f.monto)+' libres: en "Este periodo" eliges si van al ahorro o a gastar.');
       break; }
+    case 'reintentar': location.reload(); break;
     case 'goPlan': view='ajustes'; render(); window.scrollTo(0,0); break;
     case 'authModo': ui.auth.modo = ui.auth.modo==='entrar'?'crear':'entrar'; ui.auth.err=''; ui.auth.msg=''; render(); break;
     case 'authReset': { const em=document.getElementById('lg-email').value.trim(); ui.auth.email=em; if(!em){ ui.auth.err='Escribe tu correo primero.'; render(); return; }
